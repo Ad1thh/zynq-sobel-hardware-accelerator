@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Zynq-7000 Hardware/Software Co-Design Project Report</title>
+    <style>
+        body {
+            font-family: "Calibri", "Segoe UI", Arial, sans-serif;
+            line-height: 1.6;
+            color: #111;
+            max-width: 800px;
+            margin: 40px auto;
+            padding: 0 20px;
+        }
+        h1 {
+            font-size: 2em;
+            border-bottom: 2px solid #000;
+            padding-bottom: 8px;
+            text-align: center;
+        }
+        h2 {
+            font-size: 1.5em;
+            border-bottom: 1px solid #ddd;
+            padding-bottom: 4px;
+            margin-top: 30px;
+        }
+        h3 {
+            font-size: 1.25em;
+            margin-top: 24px;
+        }
+        h4 {
+            font-size: 1.15em;
+            font-style: italic;
+            margin-top: 18px;
+        }
+        pre {
+            padding: 12px;
+            border-left: 4px solid #000;
+            border-top: 1px solid #ccc;
+            border-bottom: 1px solid #ccc;
+            border-right: 1px solid #ccc;
+            overflow-x: auto;
+            margin: 15px 0;
+            background-color: #fcfcfc;
+        }
+        code {
+            font-family: "Consolas", monospace;
+            background-color: #f7f7f7;
+            font-size: 0.95em;
+            padding: 2px 4px;
+            border-radius: 3px;
+            border: 1px solid #e0e0e0;
+        }
+        pre code {
+            padding: 0;
+            background: none;
+            border: none;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        th, td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background-color: #f0f0f0;
+            font-weight: bold;
+            border-top: 1px solid #ccc;
+            border-bottom: 2px solid #999;
+        }
+        img {
+            display: block;
+            max-width: 100%;
+            height: auto;
+            margin: 20px auto;
+            border: 1px solid #ddd;
+            padding: 4px;
+            background-color: #fff;
+        }
+    </style>
+</head>
+<body>
+<h1>Zynq-7000 Hardware/Software Co-Design Project Report</h1>
+<h2>Pipelined Sobel Edge Detection Filter Core &amp; AXI4-Lite Driver</h2>
+<hr />
+<h3>Author &amp; Institution Information</h3>
+<ul>
+<li><strong>Student Name:</strong> Adithyan B</li>
+<li><strong>College/University Name:</strong> Saintgits College of Engineering, Kottayam</li>
+<li><strong>Department:</strong> Department of Electronics Engineering</li>
+<li><strong>Academic Year/Term:</strong> 2025-2026</li>
+<li><strong>Project Reference:</strong> FPGA Hardware-Software Co-Design Internship Project</li>
+</ul>
+<hr />
+<h2>1. Executive Summary</h2>
+<p>This report documents the design, implementation, and performance profiling of a real-time edge vision hardware accelerator implemented on an AMD/Xilinx Zynq-7000 All-Programmable System-on-Chip (SoC), targeting the <code>xc7z010clg400-1</code> device. The system implements a custom, hardware-accelerated 4-stage pipelined Sobel filter core (<code>spatial_filter_core</code>) in the Programmable Logic (PL) that interacts with the dual-core ARM Cortex-A9 Processing System (PS) via an AXI4-Lite slave wrapper (<code>sobel_axi_wrapper</code>).</p>
+<p>The hardware accelerator computes Sobel gradients and applies binary thresholding at a clock speed of 100 MHz. The control software driver, executed bare-metal on the ARM CPU, manages input-image row serialization and packs pixel matrices into 32-bit words, minimizing AXI write transactions. Execution speed is profiled using two distinct methods: the ARM Cortex-A9 Performance Monitor Unit (PMU) cycle counter and the Zynq Global Timer. </p>
+<p>Post-routing implementation results indicate timing closure with a Worst Negative Slack (WNS) of <strong>4.217 ns</strong> (enabling a theoretical Fmax of <strong>172.9 MHz</strong>), extremely low resource utilization (under <strong>2.3%</strong> of LUTs and <strong>1.7%</strong> of Registers), and a total power consumption of <strong>1.523 W</strong> (dominated by the ARM PS, with the core PL logic consuming just <strong>6 mW</strong>).</p>
+<hr />
+<h2>2. Mathematical Foundations of the Sobel Operator</h2>
+<p>The Sobel-Feldman operator is a discrete differentiation operator used to compute an approximation of the gradient of the image intensity function. At each point in the image, the result of the Sobel operator is either the corresponding gradient vector or the norm of this vector.</p>
+<p>For a local 3x3 pixel window centered around p11:</p>
+<p>A = [ p00  p01  p02 ]
+    [ p10  p11  p12 ]
+    [ p20  p21  p22 ]</p>
+<p>The kernels for horizontal (Gx) and vertical (Gy) derivatives are convolved with the pixel window as follows:</p>
+<p>Gx = [ -1   0  +1 ]       Gy = [ -1  -2  -1 ]
+     [ -2   0  +2 ] * A        [  0   0   0 ] * A
+     [ -1   0  +1 ]            [ +1  +2  +1 ]</p>
+<p>Expanding these convolutions gives the following gradient equations:
+* Gx = (p02 - p00) + 2 * (p12 - p10) + (p22 - p20)
+* Gy = (p20 - p00) + 2 * (p21 - p01) + (p22 - p02)</p>
+<p>In order to avoid expensive floating-point square root calculations in FPGA hardware, the gradient magnitude is approximated by summing the absolute values:</p>
+<p>|G| = |Gx| + |Gy|</p>
+<p>A threshold filter is then applied to classify the pixel:</p>
+<p>Output Pixel = 255 (if |G| &gt; Threshold), else 0</p>
+<p>In this project, the threshold is fixed at <strong>128</strong>, dividing pixels into edges (white) and background (black).</p>
+<hr />
+<h2>3. Hardware Architecture &amp; Custom RTL Design</h2>
+<h3>3.1 Pipelined Spatial Filter Core (<code>spatial_filter_core.v</code>)</h3>
+<p>To meet strict timing constraints, the Sobel filter is broken down into a 4-stage pipeline. Pipelining reduces the critical path (the longest combinational path between registers), allowing the circuit to run at much higher clock speeds.</p>
+<pre><code>                   +----------------------------------+
+                   |  Inputs: p00-p22 (8-bit Unsigned)|
+                   +-----------------+----------------+
+                                     |
++-----------------------------------v-----------------------------------+
+| STAGE 1: Row Difference Calculation (diff_x0_r1 to diff_y2_r1)        |
+| - Expands 8-bit unsigned to 11-bit signed values.                     |
+| - Computes directional pixel differences (e.g., p02 - p00).          |
++-----------------------------------+-----------------------------------+
+                                     | Registered
++-----------------------------------v-----------------------------------+
+| STAGE 2: Gradient Summation (Gx_r2, Gy_r2)                           |
+| - Sums Stage 1 differences.                                           |
+| - Multiplies center terms by 2 using hardware wire-shifting (&lt;&lt; 1).   |
++-----------------------------------+-----------------------------------+
+                                     | Registered
++-----------------------------------v-----------------------------------+
+| STAGE 3: Absolute Value Calculation (abs_Gx_r3, abs_Gy_r3)            |
+| - Resolves sign of gradients using two's complement negation if &lt; 0.  |
++-----------------------------------+-----------------------------------+
+                                     | Registered
++-----------------------------------v-----------------------------------+
+| STAGE 4: Magnitude Addition &amp; Thresholding (out_pixel)                |
+| - Adds absolute gradients and compares to 128 to output 0x00 or 0xFF. |
++-----------------------------------------------------------------------+
+</code></pre>
+<p>Here is the corresponding hardware block diagram representing the synchronous logic flow across the four pipeline registers:</p>
+<p><img alt="4-Stage Pipeline Block Diagram" src="pipeline_block_diagram.png" /></p>
+<ol>
+<li><strong>Stage 1 (Row Difference Calculation):</strong>
+   Converts inputs from 8-bit unsigned values to 11-bit signed values. This bit extension is necessary to prevent overflow/underflow during subtractions (results can range from -255 to 255).</li>
+<li><code>diff_x0_r1 &lt;= $signed({3'b0, p02}) - $signed({3'b0, p00});</code></li>
+<li><code>diff_x1_r1 &lt;= $signed({3'b0, p12}) - $signed({3'b0, p10});</code></li>
+<li><code>diff_x2_r1 &lt;= $signed({3'b0, p22}) - $signed({3'b0, p20});</code></li>
+<li><code>diff_y0_r1 &lt;= $signed({3'b0, p20}) - $signed({3'b0, p00});</code></li>
+<li><code>diff_y1_r1 &lt;= $signed({3'b0, p21}) - $signed({3'b0, p01});</code></li>
+<li>
+<p><code>diff_y2_r1 &lt;= $signed({3'b0, p22}) - $signed({3'b0, p02});</code></p>
+</li>
+<li>
+<p><strong>Stage 2 (Gradient Summation):</strong>
+   Computes the final horizontal and vertical gradients ($G_x$ and $G_y$). Multiplication by 2 is implemented as a simple left-shift (<code>&lt;&lt; 1</code>) in logic wiring, saving valuable DSP blocks:</p>
+</li>
+<li><code>Gx_r2 &lt;= diff_x0_r1 + (diff_x1_r1 &lt;&lt; 1) + diff_x2_r1;</code></li>
+<li>
+<p><code>Gy_r2 &lt;= diff_y0_r1 + (diff_y1_r1 &lt;&lt; 1) + diff_y2_r1;</code></p>
+</li>
+<li>
+<p><strong>Stage 3 (Absolute Value Calculation):</strong>
+   Calculates the absolute value of the signed gradients:</p>
+</li>
+<li><code>abs_Gx_r3 &lt;= (Gx_r2 &lt; 0) ? -Gx_r2 : Gx_r2;</code></li>
+<li>
+<p><code>abs_Gy_r3 &lt;= (Gy_r2 &lt; 0) ? -Gy_r2 : Gy_r2;</code></p>
+</li>
+<li>
+<p><strong>Stage 4 (Magnitude Addition &amp; Thresholding):</strong>
+   Sums $|Gx|$ and $|Gy|$, then applies the threshold of 128 to output either <code>8'hFF</code> (white pixel) or <code>8'h00</code> (black pixel):</p>
+</li>
+<li><code>out_pixel &lt;= ((abs_Gx_r3 + abs_Gy_r3) &gt; 12'd128) ? 8'hFF : 8'h00;</code></li>
+</ol>
+<hr />
+<h3>3.2 AXI4-Lite Peripheral Interface Wrapper (<code>sobel_axi_wrapper.v</code>)</h3>
+<p>The 3x3 pixel window inputs must be updated by the CPU. To accomplish this, the design embeds <code>spatial_filter_core</code> inside an AXI4-Lite slave IP block that maps control registers to memory locations.</p>
+<ul>
+<li><strong><code>slv_reg0</code> (Offset <code>0x00</code>):</strong> Packs the top row of pixels.</li>
+<li><code>slv_reg0[7:0]</code>   &rarr; <code>p00</code></li>
+<li><code>slv_reg0[15:8]</code>  &rarr; <code>p01</code></li>
+<li><code>slv_reg0[23:16]</code> &rarr; <code>p02</code></li>
+<li><strong><code>slv_reg1</code> (Offset <code>0x04</code>):</strong> Packs the middle row of pixels.</li>
+<li><code>slv_reg1[7:0]</code>   &rarr; <code>p10</code></li>
+<li><code>slv_reg1[15:8]</code>  &rarr; <code>p11</code></li>
+<li><code>slv_reg1[23:16]</code> &rarr; <code>p12</code></li>
+<li><strong><code>slv_reg2</code> (Offset <code>0x08</code>):</strong> Packs the bottom row of pixels.</li>
+<li><code>slv_reg2[7:0]</code>   &rarr; <code>p20</code></li>
+<li><code>slv_reg2[15:8]</code>  &rarr; <code>p21</code></li>
+<li><code>slv_reg2[23:16]</code> &rarr; <code>p22</code></li>
+<li><strong><code>slv_reg3</code> (Offset <code>0x0C</code>):</strong> Read-only register mapping. Returns <code>{24'h000000, out_pixel}</code> to read the edge detection result.</li>
+</ul>
+<h4>AXI Bus Latency masking Pipeline Delay:</h4>
+<p>Because the core is pipelined, there is a 4-cycle propagation delay from updating the inputs (<code>slv_reg0</code> to <code>slv_reg2</code>) to reading the result from <code>slv_reg3</code>. However, the software driver does not require dummy delay states (<code>nop</code> instructions). </p>
+<p>This is because an AXI-Lite read transaction takes a minimum of 4-5 AXI clock cycles on the interconnect (requiring address handshakes, read data validation, and propagation). Since the AXI bus clock runs at 100 MHz, the physical transaction duration is longer than the pipeline's 4-cycle propagation depth. Thus, the natural bus latency of the AXI interconnect masks the pipeline delay, ensuring the CPU always reads the correct, fully-settled pixel output.</p>
+<hr />
+<h2>4. Software Driver Design &amp; Benchmarking (PS)</h2>
+<p>The software driver runs bare-metal on the ARM Cortex-A9 core. It handles matrix serialization, row packing, AXI register access, and performance timing.</p>
+<h3>4.1 Pixel Row Packing Strategy</h3>
+<p>Instead of writing 9 separate pixels (which would require 9 slow AXI bus cycles), the software packs three adjacent 8-bit pixels into single 32-bit words using bit-shifting. This reduces AXI write transactions to just three:</p>
+<pre><code class="language-c">uint32_t packed_row0 = ((uint32_t)input_image[r-1][c+1] &lt;&lt; 16) |
+                       ((uint32_t)input_image[r-1][c]   &lt;&lt; 8)  |
+                        (uint32_t)input_image[r-1][c-1];
+
+uint32_t packed_row1 = ((uint32_t)input_image[r][c+1]   &lt;&lt; 16) |
+                       ((uint32_t)input_image[r][c]     &lt;&lt; 8)  |
+                        (uint32_t)input_image[r][c-1];
+
+uint32_t packed_row2 = ((uint32_t)input_image[r+1][c+1] &lt;&lt; 16) |
+                       ((uint32_t)input_image[r+1][c]   &lt;&lt; 8)  |
+                        (uint32_t)input_image[r+1][c-1];
+
+Xil_Out32(SOBEL_BASEADDR + SOBEL_REG0_OFFSET, packed_row0);
+Xil_Out32(SOBEL_BASEADDR + SOBEL_REG1_OFFSET, packed_row1);
+Xil_Out32(SOBEL_BASEADDR + SOBEL_REG2_OFFSET, packed_row2);
+
+uint32_t result = Xil_In32(SOBEL_BASEADDR + SOBEL_REG3_OFFSET);
+</code></pre>
+<h3>4.2 Software Profiling Methodologies</h3>
+<p>The driver supports two benchmarking methods to count execution latency:
+* <strong>ARM Performance Monitor Unit (PMU) CCNT Counter (<code>app_component/main.c</code>):</strong> Accesses internal ARM coprocessor registers (<code>CP15</code>) using inline assembly to read the CPU cycle counter directly. Elapsed time in microseconds is calculated by:
+  Time (us) = CCNT Cycles / 666.67 MHz
+* <strong>ARM Global Timer Counter (<code>software/main.c</code>):</strong> Accesses the hardware Global Timer peripheral (ticking at 333.33 MHz, half of the CPU speed) using <code>XTime_GetTime</code>. Estimated CPU cycles are calculated as ticks multiplied by 2.</p>
+<hr />
+<h2>5. Verification &amp; Simulation</h2>
+<h3>5.1 Testbench Simulation (<code>tb_spatial_filter.v</code>)</h3>
+<p>A simulation testbench was developed to verify core functionality prior to hardware deployment. The testbench generates a 100 MHz clock and holds reset low for 20 ns. Crucially, the testbench accounts for the 4-stage pipeline latency by waiting 4 clock cycles before sampling the output:</p>
+<pre><code class="language-verilog">task check_case(...);
+    begin
+        p00 = val00; p01 = val01; ...
+        repeat (4) @(posedge clk); // Wait for pipeline latency
+        #1; // Wait 1 ns after clock edge for print accuracy
+        $display(&quot;Output Pixel = 8'h%h&quot;, out_pixel);
+    end
+endtask
+</code></pre>
+<h4>Simulation Test Cases and Outputs:</h4>
+<ol>
+<li><strong>Uniform Region:</strong> Input window consists of homogeneous values (100). Results: Gx = 0, Gy = 0, Output = 8'h00 (No Edge).</li>
+<li><strong>Strong Vertical Edge:</strong> Left column is dark (10), right column is bright (240). Results: |Gx| = 920, |Gy| = 0, Magnitude = 920 &gt; 128, Output = 8'hFF (Edge).</li>
+<li><strong>Strong Horizontal Edge:</strong> Top row is dark (10), bottom row is bright (240). Results: |Gx| = 0, |Gy| = 920, Magnitude = 920 &gt; 128, Output = 8'hFF (Edge).</li>
+<li><strong>Weak Edge:</strong> Small intensity variation (100 vs. 110). Results: Magnitude = 40 &lt; 128, Output = 8'h00 (No Edge).</li>
+</ol>
+<p>All simulation runs validated the RTL design's functional accuracy.</p>
+<hr />
+<h2>6. Synthesis &amp; Implementation Analysis (Visual Report Explanations)</h2>
+<p>This section details the physical implementation parameters of the design on the target FPGA, providing detailed technical explanations for each of the visual captures exported from the Vivado and Vitis IDEs.</p>
+<h3>6.1 Figure 1: Block Design Architecture</h3>
+<p><img alt="Block Design" src="Block Design.png" /></p>
+<h4>Technical Explanation of Figure 1:</h4>
+<p>The Vivado IP Integrator Block Design shown in Figure 1 defines the top-level hardware schematic of the SoC. The dual-core ARM Cortex-A9 CPU is represented by the <code>processing_system7_0</code> block. The CPU interacts with the custom Sobel hardware accelerator through its General-Purpose Master AXI interface (<code>M_AXI_GP0</code>), which is configured to route memory access requests to the <code>axi_interconnect_0</code> bus. The AXI Interconnect block acts as a bridge, translating the AXI3 bus protocol signals of the ARM CPU into the AXI4-Lite protocol signals expected by the custom <code>sobel_axi_wrapper_0</code> IP block.</p>
+<p>Reset and clock trees are managed by the auxiliary blocks. The <code>proc_sys_reset_0</code> block receives a master reset from the processor system and generates synchronized reset signals (<code>peripheral_aresetn</code>) to prevent metastability on the AXI bus and core logic registers. The clock network is driven by the <code>FCLK_CLK0</code> port on the PS7 block, configured to generate a stable 100 MHz clock. This clock is buffered and distributed through a global clock tree to route to the <code>S_AXI_ACLK</code> ports of the interconnect and the custom Sobel wrapper, establishing a unified synchronous clock domain across the system.</p>
+<hr />
+<h3>6.2 Figure 2: Top-Level Wrapper Schematic</h3>
+<p><img alt="Top-Level Wrapper Schematic" src="top_schematic.png" /></p>
+<h4>Technical Explanation of Figure 2:</h4>
+<p>The top-level hardware schematic wrapper (<code>system_bd_wrapper</code>) shown in Figure 2 represents the physical boundary of the Zynq-7000 SoC design, mapping the internal logical signals of the block design (<code>system_bd_i</code>) to the dedicated external physical package pins of the Zynq chip. </p>
+<p>The signals on the left of the block represent the external memory and core peripheral interfaces:
+* <strong>DDR Memory Interface:</strong> Dedicated high-speed memory channel pins including clock signals (<code>DDR_ck_p</code>, <code>DDR_ck_n</code>), address lines (<code>DDR_addr[14:0]</code>), bank address selection (<code>DDR_ba[2:0]</code>), data masks (<code>DDR_dm[3:0]</code>), data lines (<code>DDR_dq[31:0]</code>), and differential data strobes (<code>DDR_dqs_p[3:0]</code>, <code>DDR_dqs_n[3:0]</code>). These pins establish a direct interface to the board's DDR3 SDRAM, allowing high-throughput DMA transfers and software execution memory spaces.
+* <strong>Fixed I/O Pins (FIXED_IO_mio[53:0]):</strong> The 54 Multi-use I/O (MIO) pins connect the Processing System (PS) peripherals (such as UART for the serial monitor, USB, Ethernet, and SD card controllers) to physical board peripherals.
+* <strong>PS Clock and Resets:</strong> Include the main processor clock source (<code>FIXED_IO_ps_clk</code>), Power-on Reset (<code>FIXED_IO_ps_porb</code>), and system reset (<code>FIXED_IO_ps_srstb</code>) lines to coordinate processor power-up states and synchronous clock domains.</p>
+<hr />
+<h3>6.3 Figure 3: Register Memory Address Assignment</h3>
+<p><img alt="Address Editor" src="Address Editor.png" /></p>
+<h4>Technical Explanation of Figure 3:</h4>
+<p>The Address Editor mapping shown in Figure 3 illustrates the physical address space allocation within the Zynq SoC. The custom Sobel AXI wrapper is mapped as an external memory-mapped peripheral connected to the general-purpose interconnect. The master processing system (<code>processing_system7_0</code>) is allocated a base address of <code>0x43C0_0000</code> with an address range of 64 KB, bounding the device register space from <code>0x43C0_0000</code> to <code>0x43C0_FFFF</code>. This range is sufficient to map the four 32-bit registers (<code>slv_reg0</code> to <code>slv_reg3</code>) used for communication.</p>
+<p>In software, this hardware address configuration is accessed using Memory-Mapped I/O (MMIO). The C driver utilizes a base pointer definition <code>#define SOBEL_BASEADDR 0x43C00000</code> combined with 4-byte offsets (<code>0x0</code>, <code>0x4</code>, <code>0x8</code>, <code>0xC</code>). Dereferencing these addresses via pointers (wrapped in standard Xilinx hardware utilities <code>Xil_Out32</code> and <code>Xil_In32</code>) triggers the Master AXI channel on the processor. The channel generates read or write cycles on the AXI interconnect that resolve directly to the registers inside the <code>sobel_axi_wrapper</code> block.</p>
+<hr />
+<h3>6.4 Figure 4: Device Logic Resource Utilization</h3>
+<p><img alt="Utilization" src="Utilization.png" /></p>
+<h4>Technical Explanation of Figure 4:</h4>
+<p>The Post-Implementation Resource Utilization report shown in Figure 4 evaluates the hardware logic footprint on the Zynq <code>xc7z010clg400-1</code> device. The design consumes only 395 Look-Up Tables (LUTs), representing a tiny 2.24% of the 17,600 available LUT slices, and 568 Flip-Flops/Registers, representing 1.61% of the 35,200 available Registers. This small layout footprint demonstrates the hardware efficiency of the custom Sobel core, allowing it to easily co-exist with much larger IP blocks (such as HDMI controllers, DMAs, or neural network accelerators) on a single FPGA chip.</p>
+<p>Significantly, the report shows that the utilization of specialized DSP48E1 slices and Block RAM (BRAM) tiles is 0.00%. Sobel filtering typically requires multiplication (scaling by 2), which would normally compile to DSP multiplier blocks. However, because the design utilizes hardwired logical wire shifts (<code>&lt;&lt; 1</code>) to multiply values in Stage 2, it is implemented entirely using standard LUT gates. The 3x3 pixel window buffer is fully distributed across fabric flip-flops (registers) rather than dedicated Block RAM tiles, keeping RAM tiles free for large buffer spaces.</p>
+<hr />
+<h3>6.5 Figure 5: Timing Summary &amp; Slack Analysis</h3>
+<p><img alt="Timing" src="Timing.png" /></p>
+<h4>Technical Explanation of Figure 5:</h4>
+<p>The Post-Route Timing Summary report shown in Figure 5 confirms timing closure and stable synchronous operation under the 100 MHz clock constraint (10.0 ns clock period). The Worst Negative Slack (WNS) is reported as <strong>4.217 ns</strong>, indicating that the longest delay path in the design completes in only 5.783 ns (including logic cell delay and routing interconnect net delays), leaving a safety margin of over 42%. The Worst Hold Slack (WHS) is positive at <strong>0.055 ns</strong>, confirming that clock skew is minimized and data is held stable at register inputs long enough to prevent race conditions or metastability. The Worst Pulse Width Slack (WPWS) is met at <strong>4.020 ns</strong>, confirming that the clock pulse shapes are clean and free of distortion.</p>
+<p>The positive WNS margin of 4.217 ns shows the benefit of the 4-stage pipeline design. In a non-pipelined design, the calculations for row differences, gradient sums, absolute values, and thresholding would be combined into a single clock cycle, creating a long delay path that would cause timing violations at 100 MHz. By inserting pipeline registers between each calculation stage, the critical path is split into four short, fast stages. Based on the timing report, the design could theoretically operate at:
+Fmax = 1 / (T_period - WNS) = 1 / (10.0 ns - 4.217 ns) ≈ 172.9 MHz</p>
+<hr />
+<h3>6.6 Figure 6: Physical Execution Results &amp; Serial Output</h3>
+<p><img alt="Vitis - Serial Monitor" src="Vitis - Serial Monitor.png" /></p>
+<h4>Technical Explanation of Figure 6:</h4>
+<p>The Vitis Serial Console log shown in Figure 6 displays the real-time execution results of the bare-metal C application running on the Zynq ARM processor. The driver starts by printing the input $5 \times 5$ grayscale matrix, where a strong vertical intensity transition (from value 10 to 240) exists between column 1 and column 2. The program then loops through the matrix, sending pixel data to the AXI registers, and reads back the resulting $3 \times 3$ output matrix:</p>
+<pre><code>  [ 255 255   0 ]
+  [ 255 255   0 ]
+  [ 255 255   0 ]
+</code></pre>
+<p>The columns with value <code>255</code> (white) show that a vertical edge was successfully detected at columns 1 and 2, matching the intensity transition in the input image.</p>
+<p>The performance profile section printed on the console indicates the execution speed. It displays the elapsed CPU clock cycles (measured directly via the PMU cycle counter CCNT) and the calculated time in microseconds. The loop completes in under <strong>2 microseconds</strong> of execution time. This rapid processing highlights the efficiency of offloading calculations to the PL coprocessor, as the CPU only needs to pack data and write to registers, while the PL performs the heavy arithmetic operations in parallel.</p>
+<hr />
+<h2>7. Conclusions &amp; System Recommendations</h2>
+<p>The Zynq-7000 Hardware/Software Co-design implementation of the Sobel edge filter successfully meets all operational design parameters. The custom pipelined core offers excellent performance, timing safety margins, and small area overhead, consuming less than 2.3% of the FPGA logic slices.</p>
+<h3>Recommendations for Future Enhancements:</h3>
+<ol>
+<li><strong>AXI DMA Integration:</strong> For large images (e.g., Full HD 1080p), manual register access by the CPU creates a bottleneck. Integrating an AXI Direct Memory Access (DMA) core will allow streaming image frames directly from DDR3 memory to the PL via an AXI-Stream interface, removing CPU intervention.</li>
+<li><strong>PL Line Buffering:</strong> Designing internal line buffers using Block RAM inside the custom IP core will allow the accelerator to store previous image rows. This will enable processing a continuous streaming pixel input in a single pass, rather than having the CPU send overlapping row data.</li>
+<li><strong>Programmable Thresholding:</strong> The threshold is currently hardwired at 128. Modifying the AXI wrapper to map the threshold to an unused portion of <code>slv_reg0</code> or a new register will allow the software to dynamically adjust edge sensitivity based on image lighting conditions.</li>
+</ol>
+</body>
+</html>

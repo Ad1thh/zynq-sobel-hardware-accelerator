@@ -1,0 +1,31 @@
+# Vivado Project files to ignore
+Prj_final/*.cache/
+Prj_final/*.hw/
+Prj_final/*.ip_user_files/
+Prj_final/*.runs/
+Prj_final/*.sim/
+Prj_final/*.gen/
+Prj_final/*.tmp/
+Prj_final/*.xpr.bak
+Prj_final/*.jou
+Prj_final/*.log
+Prj_final/.Xil/
+Prj_final/system_bd_wrapper.v
+
+# Vitis Workspace files to ignore
+.vitisWorkspace.json
+_ide/
+platform/
+app_component/build/
+app_component/bin/
+software/Debug/
+software/Release/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+~$*.docx
+*.docx.bak
+*.log
+_new.docx
+_latest.docx
