@@ -18,7 +18,7 @@ A high-performance, real-time edge vision hardware accelerator implemented on an
 
 ```
 ├── README.md                          # Project Documentation
-├── Project_Report.docx                # Complete Academic Project Report (Word)
+├── Project_Report.pdf                 # Complete Academic Project Report (PDF)
 ├── pipeline_block_diagram.png         # Hardware pipeline diagram
 ├── top_schematic.png                  # Top-level I/O boundary schematic
 ├── Block Design.png                   # Vivado block design schematic
