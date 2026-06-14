@@ -310,5 +310,556 @@ Fmax = 1 / (T_period - WNS) = 1 / (10.0 ns - 4.217 ns) ≈ 172.9 MHz</p>
 <li><strong>PL Line Buffering:</strong> Designing internal line buffers using Block RAM inside the custom IP core will allow the accelerator to store previous image rows. This will enable processing a continuous streaming pixel input in a single pass, rather than having the CPU send overlapping row data.</li>
 <li><strong>Programmable Thresholding:</strong> The threshold is currently hardwired at 128. Modifying the AXI wrapper to map the threshold to an unused portion of <code>slv_reg0</code> or a new register will allow the software to dynamically adjust edge sensitivity based on image lighting conditions.</li>
 </ol>
+<hr />
+<h2>8. Appendix: Complete Source Code Listings</h2>
+<p>The complete hardware and software source code for this project is hosted on GitHub:
+<strong>GitHub Repository:</strong> <a href="https://github.com/Ad1thh/zynq-sobel-hardware-accelerator">https://github.com/Ad1thh/zynq-sobel-hardware-accelerator</a></p>
+<p>This appendix provides the complete hardware description language (RTL Verilog) source code, testbench environment, and CPU bare-metal application driver software used in this project.</p>
+<h3>8.1 Custom Pipelined Sobel Filter Core (<code>spatial_filter_core.v</code>)</h3>
+<pre><code class="language-verilog">`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Module Name: spatial_filter_core (4-Stage Pipelined)
+// Description:
+//   A high-performance 4-stage pipelined Sobel filter core.
+//   Optimized to closure timing under a 5.0 ns clock period (200 MHz+).
+//////////////////////////////////////////////////////////////////////////////////
+
+module spatial_filter_core (
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire [7:0]  p00, p01, p02,
+    input  wire [7:0]  p10, p11, p12,
+    input  wire [7:0]  p20, p21, p22,
+    output reg  [7:0]  out_pixel
+);
+
+    // ==========================================
+    // STAGE 1: Row Difference Calculation
+    // ==========================================
+    reg signed [10:0] diff_x0_r1;
+    reg signed [10:0] diff_x1_r1;
+    reg signed [10:0] diff_x2_r1;
+
+    reg signed [10:0] diff_y0_r1;
+    reg signed [10:0] diff_y1_r1;
+    reg signed [10:0] diff_y2_r1;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (~rst_n) begin
+            diff_x0_r1 &lt;= 11'sd0;
+            diff_x1_r1 &lt;= 11'sd0;
+            diff_x2_r1 &lt;= 11'sd0;
+            diff_y0_r1 &lt;= 11'sd0;
+            diff_y1_r1 &lt;= 11'sd0;
+            diff_y2_r1 &lt;= 11'sd0;
+        end else begin
+            diff_x0_r1 &lt;= $signed({3'b0, p02}) - $signed({3'b0, p00});
+            diff_x1_r1 &lt;= $signed({3'b0, p12}) - $signed({3'b0, p10});
+            diff_x2_r1 &lt;= $signed({3'b0, p22}) - $signed({3'b0, p20});
+
+            diff_y0_r1 &lt;= $signed({3'b0, p20}) - $signed({3'b0, p00});
+            diff_y1_r1 &lt;= $signed({3'b0, p21}) - $signed({3'b0, p01});
+            diff_y2_r1 &lt;= $signed({3'b0, p22}) - $signed({3'b0, p02});
+        end
+    end
+
+    // ==========================================
+    // STAGE 2: Gradient Summation (Gx, Gy)
+    // ==========================================
+    reg signed [10:0] Gx_r2;
+    reg signed [10:0] Gy_r2;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (~rst_n) begin
+            Gx_r2 &lt;= 11'sd0;
+            Gy_r2 &lt;= 11'sd0;
+        end else begin
+            // Shift operation for hardware-efficient multiplier by 2
+            Gx_r2 &lt;= diff_x0_r1 + (diff_x1_r1 &lt;&lt; 1) + diff_x2_r1;
+            Gy_r2 &lt;= diff_y0_r1 + (diff_y1_r1 &lt;&lt; 1) + diff_y2_r1;
+        end
+    end
+
+    // ==========================================
+    // STAGE 3: Absolute Value Calculation
+    // ==========================================
+    reg signed [10:0] abs_Gx_r3;
+    reg signed [10:0] abs_Gy_r3;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (~rst_n) begin
+            abs_Gx_r3 &lt;= 11'sd0;
+            abs_Gy_r3 &lt;= 11'sd0;
+        end else begin
+            abs_Gx_r3 &lt;= (Gx_r2 &lt; 0) ? -Gx_r2 : Gx_r2;
+            abs_Gy_r3 &lt;= (Gy_r2 &lt; 0) ? -Gy_r2 : Gy_r2;
+        end
+    end
+
+    // ==========================================
+    // STAGE 4: Magnitude Addition &amp; Thresholding
+    // ==========================================
+    always @(posedge clk or negedge rst_n) begin
+        if (~rst_n) begin
+            out_pixel &lt;= 8'h00;
+        end else begin
+            out_pixel &lt;= ((abs_Gx_r3 + abs_Gy_r3) &gt; 12'd128) ? 8'hFF : 8'h00;
+        end
+    end
+
+endmodule
+</code></pre>
+<h3>8.2 AXI4-Lite Register Interface Wrapper (<code>sobel_axi_wrapper.v</code>)</h3>
+<pre><code class="language-verilog">`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Module Name: sobel_axi_wrapper
+// Description:
+//   AXI4-Lite Slave wrapper mapping 4 configuration registers and interfacing 
+//   with the pipelined spatial_filter_core module.
+//////////////////////////////////////////////////////////////////////////////////
+
+module sobel_axi_wrapper # (
+    parameter integer C_S_AXI_DATA_WIDTH = 32,
+    parameter integer C_S_AXI_ADDR_WIDTH = 4
+) (
+    input wire  S_AXI_ACLK,
+    input wire  S_AXI_ARESETN,
+    input wire [C_S_AXI_ADDR_WIDTH-1 : 0] S_AXI_AWADDR,
+    input wire [2 : 0] S_AXI_AWPROT,
+    input wire  S_AXI_AWVALID,
+    output wire  S_AXI_AWREADY,
+    input wire [C_S_AXI_DATA_WIDTH-1 : 0] S_AXI_WDATA,
+    input wire [(C_S_AXI_DATA_WIDTH/8)-1 : 0] S_AXI_WSTRB,
+    input wire  S_AXI_WVALID,
+    output wire  S_AXI_WREADY,
+    output wire [1 : 0] S_AXI_BRESP,
+    output wire  S_AXI_BVALID,
+    input wire  S_AXI_BREADY,
+    input wire [C_S_AXI_ADDR_WIDTH-1 : 0] S_AXI_ARADDR,
+    input wire [2 : 0] S_AXI_ARPROT,
+    input wire  S_AXI_ARVALID,
+    output wire  S_AXI_ARREADY,
+    output wire [C_S_AXI_DATA_WIDTH-1 : 0] S_AXI_RDATA,
+    output wire [1 : 0] S_AXI_RRESP,
+    output wire  S_AXI_RVALID,
+    input wire  S_AXI_RREADY
+);
+
+    reg [C_S_AXI_ADDR_WIDTH-1 : 0]     axi_awaddr;
+    reg      axi_awready;
+    reg      axi_wready;
+    reg [1 : 0]     axi_bresp;
+    reg      axi_bvalid;
+    reg [C_S_AXI_ADDR_WIDTH-1 : 0]     axi_araddr;
+    reg      axi_arready;
+    reg [C_S_AXI_DATA_WIDTH-1 : 0]     axi_rdata;
+    reg [1 : 0]     axi_rresp;
+    reg      axi_rvalid;
+
+    localparam integer ADDR_LSB = 2;
+    localparam integer OPT_MEM_ADDR_BITS = 1;
+
+    reg [C_S_AXI_DATA_WIDTH-1:0]    slv_reg0;
+    reg [C_S_AXI_DATA_WIDTH-1:0]    slv_reg1;
+    reg [C_S_AXI_DATA_WIDTH-1:0]    slv_reg2;
+
+    integer byte_index;
+
+    assign S_AXI_AWREADY    = axi_awready;
+    assign S_AXI_WREADY     = axi_wready;
+    assign S_AXI_BRESP      = axi_bresp;
+    assign S_AXI_BVALID     = axi_bvalid;
+    assign S_AXI_ARREADY    = axi_arready;
+    assign S_AXI_RDATA      = axi_rdata;
+    assign S_AXI_RRESP      = axi_rresp;
+    assign S_AXI_RVALID     = axi_rvalid;
+
+    always @( posedge S_AXI_ACLK ) begin
+      if ( S_AXI_ARESETN == 1'b0 ) begin
+          axi_awready &lt;= 1'b0;
+      end else begin    
+          if (~axi_awready &amp;&amp; S_AXI_AWVALID &amp;&amp; S_AXI_WVALID) begin
+              axi_awready &lt;= 1'b1;
+          end else begin
+              axi_awready &lt;= 1'b0;
+          end
+      end
+    end       
+
+    always @( posedge S_AXI_ACLK ) begin
+      if ( S_AXI_ARESETN == 1'b0 ) begin
+          axi_awaddr &lt;= 0;
+      end else begin    
+          if (~axi_awready &amp;&amp; S_AXI_AWVALID &amp;&amp; S_AXI_WVALID) begin
+              axi_awaddr &lt;= S_AXI_AWADDR;
+          end
+      end
+    end       
+
+    always @( posedge S_AXI_ACLK ) begin
+      if ( S_AXI_ARESETN == 1'b0 ) begin
+          axi_wready &lt;= 1'b0;
+      end else begin    
+          if (~axi_wready &amp;&amp; S_AXI_WVALID &amp;&amp; S_AXI_AWVALID) begin
+              axi_wready &lt;= 1'b1;
+          end else begin
+              axi_wready &lt;= 1'b0;
+          end
+      end
+    end       
+
+    wire slv_reg_wren = axi_wready &amp;&amp; S_AXI_WVALID &amp;&amp; axi_awready &amp;&amp; S_AXI_AWVALID;
+
+    always @( posedge S_AXI_ACLK ) begin
+      if ( S_AXI_ARESETN == 1'b0 ) begin
+          slv_reg0 &lt;= 32'h0;
+          slv_reg1 &lt;= 32'h0;
+          slv_reg2 &lt;= 32'h0;
+      end else begin
+          if (slv_reg_wren) begin
+              case ( axi_awaddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB] )
+                2'h0: begin
+                  for ( byte_index = 0; byte_index &lt;= 3; byte_index = byte_index+1 )
+                    if ( S_AXI_WSTRB[byte_index] == 1 ) begin
+                      slv_reg0[(byte_index*8) +: 8] &lt;= S_AXI_WDATA[(byte_index*8) +: 8];
+                    end
+                end
+                2'h1: begin
+                  for ( byte_index = 0; byte_index &lt;= 3; byte_index = byte_index+1 )
+                    if ( S_AXI_WSTRB[byte_index] == 1 ) begin
+                      slv_reg1[(byte_index*8) +: 8] &lt;= S_AXI_WDATA[(byte_index*8) +: 8];
+                    end
+                end
+                2'h2: begin
+                  for ( byte_index = 0; byte_index &lt;= 3; byte_index = byte_index+1 )
+                    if ( S_AXI_WSTRB[byte_index] == 1 ) begin
+                      slv_reg2[(byte_index*8) +: 8] &lt;= S_AXI_WDATA[(byte_index*8) +: 8];
+                    end
+                end
+                default : begin
+                  slv_reg0 &lt;= slv_reg0;
+                  slv_reg1 &lt;= slv_reg1;
+                  slv_reg2 &lt;= slv_reg2;
+                end
+              endcase
+          end
+      end
+    end
+
+    always @( posedge S_AXI_ACLK ) begin
+      if ( S_AXI_ARESETN == 1'b0 ) begin
+          axi_bvalid  &lt;= 1'b0;
+          axi_bresp   &lt;= 2'b0;
+      end else begin    
+          if (axi_awready &amp;&amp; S_AXI_AWVALID &amp;&amp; ~axi_bvalid &amp;&amp; axi_wready &amp;&amp; S_AXI_WVALID) begin
+              axi_bvalid &lt;= 1'b1;
+              axi_bresp  &lt;= 2'b0;
+          end else begin
+              if (S_AXI_BREADY &amp;&amp; axi_bvalid) begin
+                  axi_bvalid &lt;= 1'b0;
+              end  
+          end
+      end
+    end
+
+    always @( posedge S_AXI_ACLK ) begin
+      if ( S_AXI_ARESETN == 1'b0 ) begin
+          axi_arready &lt;= 1'b0;
+          axi_araddr  &lt;= 32'b0;
+      end else begin    
+          if (~axi_arready &amp;&amp; S_AXI_ARVALID) begin
+              axi_arready &lt;= 1'b1;
+              axi_araddr  &lt;= S_AXI_ARADDR;
+          end else begin
+              axi_arready &lt;= 1'b0;
+          end
+      end
+    end
+
+    always @( posedge S_AXI_ACLK ) begin
+      if ( S_AXI_ARESETN == 1'b0 ) begin
+          axi_rvalid &lt;= 1'b0;
+          axi_rresp  &lt;= 2'b0;
+      end else begin    
+          if (axi_arready &amp;&amp; S_AXI_ARVALID &amp;&amp; ~axi_rvalid) begin
+              axi_rvalid &lt;= 1'b1;
+              axi_rresp  &lt;= 2'b0;
+          end else if (axi_rvalid &amp;&amp; S_AXI_RREADY) begin
+              axi_rvalid &lt;= 1'b0;
+          end
+      end
+    end
+
+    // Instantiate Pipelined Sobel Core
+    wire [7:0] out_pixel;
+
+    spatial_filter_core core_inst (
+        .clk(S_AXI_ACLK),
+        .rst_n(S_AXI_ARESETN),
+        .p00(slv_reg0[7:0]),
+        .p01(slv_reg0[15:8]),
+        .p02(slv_reg0[23:16]),
+        .p10(slv_reg1[7:0]),
+        .p11(slv_reg1[15:8]),
+        .p12(slv_reg1[23:16]),
+        .p20(slv_reg2[7:0]),
+        .p21(slv_reg2[15:8]),
+        .p22(slv_reg2[23:16]),
+        .out_pixel(out_pixel)
+    );
+
+    wire [C_S_AXI_DATA_WIDTH-1:0] reg_data_out;
+
+    assign reg_data_out = (axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB] == 2'h0) ? slv_reg0 :
+                          (axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB] == 2'h1) ? slv_reg1 :
+                          (axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB] == 2'h2) ? slv_reg2 :
+                          (axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB] == 2'h3) ? {24'h000000, out_pixel} :
+                          32'h00000000;
+
+    always @( posedge S_AXI_ACLK ) begin
+      if ( S_AXI_ARESETN == 1'b0 ) begin
+          axi_rdata  &lt;= 32'h0;
+      end else begin    
+          if (axi_arready &amp;&amp; S_AXI_ARVALID &amp;&amp; ~axi_rvalid) begin
+              axi_rdata &lt;= reg_data_out;
+          end   
+      end
+    end
+
+endmodule
+</code></pre>
+<h3>8.3 Simulation Testbench (<code>tb_spatial_filter.v</code>)</h3>
+<pre><code class="language-verilog">`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Module Name: tb_spatial_filter
+// Description:
+//   An updated testbench to simulate and verify the 4-stage pipelined 
+//   spatial_filter_core. Generates clock/reset signals and accounts for 
+//   the 4-cycle pipeline propagation delay.
+//////////////////////////////////////////////////////////////////////////////////
+
+module tb_spatial_filter;
+
+    // Clock and Reset signals
+    reg clk;
+    reg rst_n;
+
+    // Inputs
+    reg [7:0] p00, p01, p02;
+    reg [7:0] p10, p11, p12;
+    reg [7:0] p20, p21, p22;
+
+    // Outputs
+    wire [7:0] out_pixel;
+
+    // Instantiate the Unit Under Test (UUT)
+    spatial_filter_core uut (
+        .clk(clk),
+        .rst_n(rst_n),
+        .p00(p00), .p01(p01), .p02(p02),
+        .p10(p10), .p11(p11), .p12(p12),
+        .p20(p20), .p21(p21), .p22(p22),
+        .out_pixel(out_pixel)
+    );
+
+    // Clock Generation: 100 MHz clock (10 ns period)
+    always #5 clk = ~clk;
+
+    // Helper task to apply inputs, wait for pipeline latency, and display results
+    task check_case(
+        input [7:0] val00, input [7:0] val01, input [7:0] val02,
+        input [7:0] val10, input [7:0] val11, input [7:0] val12,
+        input [7:0] val20, input [7:0] val21, input [7:0] val22,
+        input [80*8:1] label
+    );
+        begin
+            p00 = val00; p01 = val01; p02 = val02;
+            p10 = val10; p11 = val11; p12 = val12;
+            p20 = val20; p21 = val21; p22 = val22;
+
+            // Wait for 4 clock cycles (pipeline depth) for outputs to settle
+            repeat (4) @(posedge clk);
+            #1; // Wait 1 ns after clock edge for print accuracy
+
+            $display(&quot;--- Test Case: %s ---&quot;, label);
+            $display(&quot;  [%d\t%d\t%d]&quot;, p00, p01, p02);
+            $display(&quot;  [%d\t%d\t%d]&quot;, p10, p11, p12);
+            $display(&quot;  [%d\t%d\t%d]&quot;, p20, p21, p22);
+            $display(&quot;Calculated Gx = %d, Gy = %d&quot;, uut.Gx_r2, uut.Gy_r2);
+            $display(&quot;Total Gradient Magnitude = %d&quot;, (uut.abs_Gx_r3 + uut.abs_Gy_r3));
+            $display(&quot;Output Pixel = 8'h%h (%s)\n&quot;, out_pixel, (out_pixel == 8'hFF) ? &quot;EDGE&quot; : &quot;NO EDGE&quot;);
+        end
+    endtask
+
+    initial begin
+        $display(&quot;====================================================&quot;);
+        $display(&quot;STARTING PIPELINED SOBEL ACCELERATOR SIMULATION&quot;);
+        $display(&quot;====================================================\n&quot;);
+
+        // Initialize signals
+        clk = 0;
+        rst_n = 0;
+
+        // Hold reset for 20 ns
+        #20;
+        rst_n = 1;
+        #10;
+
+        // Case 1: Homogeneous Region (Flat background, no gradient)
+        check_case(
+            8'd100, 8'd100, 8'd100,
+            8'd100, 8'd100, 8'd100,
+            8'd100, 8'd100, 8'd100,
+            &quot;Flat Uniform Region (No Edge)&quot;
+        );
+
+        // Case 2: Strong Vertical Edge Transition (Left side dark, Right side bright)
+        check_case(
+            8'd10,  8'd10,  8'd240,
+            8'd10,  8'd10,  8'd240,
+            8'd10,  8'd10,  8'd240,
+            &quot;Strong Vertical Edge&quot;
+        );
+
+        // Case 3: Strong Horizontal Edge Transition (Top side dark, Bottom side bright)
+        check_case(
+            8'd10,  8'd10,  8'd10,
+            8'd10,  8'd10,  8'd10,
+            8'd240, 8'd240, 8'd240,
+            &quot;Strong Horizontal Edge&quot;
+        );
+
+        // Case 4: Weak Edge (Under Threshold)
+        check_case(
+            8'd100, 8'd100, 8'd110,
+            8'd100, 8'd100, 8'd110,
+            8'd100, 8'd100, 8'd110,
+            &quot;Weak Edge (Under Threshold 128)&quot;
+        );
+
+        $display(&quot;SIMULATION COMPLETE&quot;);
+        $finish;
+    end
+
+endmodule
+</code></pre>
+<h3>8.4 Bare-Metal Application Driver (<code>main.c</code>)</h3>
+<pre><code class="language-c">#include &lt;stdio.h&gt;
+#include &lt;stdint.h&gt;
+#include &quot;xil_io.h&quot;
+
+#include &quot;xil_io.h&quot;
+
+#define SOBEL_BASEADDR 0x43C00000
+
+#define SOBEL_REG0_OFFSET 0x0
+#define SOBEL_REG1_OFFSET 0x4
+#define SOBEL_REG2_OFFSET 0x8
+#define SOBEL_REG3_OFFSET 0xC
+
+static const uint8_t input_image[5][5] = {
+    {10, 10, 240, 240, 240},
+    {10, 10, 240, 240, 240},
+    {10, 10, 240, 240, 240},
+    {10, 10, 240, 240, 240},
+    {10, 10, 240, 240, 240}
+};
+
+static uint8_t output_image[3][3];
+
+// Helper functions to control ARM Cortex-A9 Performance Monitor Unit (PMU) Cycle Counter
+static inline void init_ccnt() {
+    #ifdef __arm__
+        // Enable PMU and reset cycle counter
+        asm volatile (&quot;mcr p15, 0, %0, c9, c12, 0&quot; :: &quot;r&quot;(0x17)); 
+        // Enable CCNT (bit 31)
+        asm volatile (&quot;mcr p15, 0, %0, c9, c12, 1&quot; :: &quot;r&quot;(0x80000000));
+    #endif
+}
+
+static inline uint32_t read_ccnt() {
+    uint32_t cc = 0;
+    #ifdef __arm__
+        asm volatile (&quot;mrc p15, 0, %0, c9, c13, 0&quot; : &quot;=r&quot;(cc));
+    #endif
+    return cc;
+}
+
+int main() {
+    uint32_t tStart, tEnd;
+    int r, c;
+
+    printf(&quot;====================================================\n&quot;);
+    printf(&quot;Zynq-7000 Real-Time Edge Vision Convolution Driver  \n&quot;);
+    printf(&quot;Hardware/Software Co-Design - Sobel Accelerator Core\n&quot;);
+    printf(&quot;====================================================\n\n&quot;);
+
+    printf(&quot;Input Grayscale Image Matrix (5x5):\n&quot;);
+    for (r = 0; r &lt; 5; r++) {
+        printf(&quot;  [ &quot;);
+        for (c = 0; c &lt; 5; c++) {
+            printf(&quot;%3d &quot;, input_image[r][c]);
+        }
+        printf(&quot;]\n&quot;);
+    }
+    printf(&quot;\n&quot;);
+
+    // Initialize the CPU performance counters
+    init_ccnt();
+
+    // Read start cycles
+    tStart = read_ccnt();
+
+    for (r = 1; r &lt;= 3; r++) {
+        for (c = 1; c &lt;= 3; c++) {
+            uint32_t packed_row0 = ((uint32_t)input_image[r-1][c+1] &lt;&lt; 16) |
+                                   ((uint32_t)input_image[r-1][c]   &lt;&lt; 8)  |
+                                    (uint32_t)input_image[r-1][c-1];
+
+            uint32_t packed_row1 = ((uint32_t)input_image[r][c+1]   &lt;&lt; 16) |
+                                   ((uint32_t)input_image[r][c]     &lt;&lt; 8)  |
+                                    (uint32_t)input_image[r][c-1];
+
+            uint32_t packed_row2 = ((uint32_t)input_image[r+1][c+1] &lt;&lt; 16) |
+                                   ((uint32_t)input_image[r+1][c]   &lt;&lt; 8)  |
+                                    (uint32_t)input_image[r+1][c-1];
+
+            Xil_Out32(SOBEL_BASEADDR + SOBEL_REG0_OFFSET, packed_row0);
+            Xil_Out32(SOBEL_BASEADDR + SOBEL_REG1_OFFSET, packed_row1);
+            Xil_Out32(SOBEL_BASEADDR + SOBEL_REG2_OFFSET, packed_row2);
+
+            uint32_t result = Xil_In32(SOBEL_BASEADDR + SOBEL_REG3_OFFSET);
+            output_image[r-1][c-1] = (uint8_t)(result &amp; 0xFF);
+        }
+    }
+
+    // Read end cycles
+    tEnd = read_ccnt();
+
+    printf(&quot;Edge-Detected Output Image Matrix (3x3):\n&quot;);
+    for (r = 0; r &lt; 3; r++) {
+        printf(&quot;  [ &quot;);
+        for (c = 0; c &lt; 3; c++) {
+            printf(&quot;%3d &quot;, output_image[r][c]);
+        }
+        printf(&quot;]\n&quot;);
+    }
+    printf(&quot;\n&quot;);
+
+    uint32_t elapsed_cycles = tEnd - tStart;
+
+    // CPU runs at 666.67 MHz (1 cycle = 1.5 ns) on Zybo Z7-10
+    double elapsed_us = (double)elapsed_cycles / 666.666687;
+
+    printf(&quot;====================================================\n&quot;);
+    printf(&quot;Hardware Accelerator Performance Profile\n&quot;);
+    printf(&quot;====================================================\n&quot;);
+    printf(&quot;ARM CPU Clock Cycles : %u cycles\n&quot;, elapsed_cycles);
+    printf(&quot;Elapsed Execution    : %.3f microseconds\n&quot;, elapsed_us);
+    printf(&quot;====================================================\n&quot;);
+
+    return 0;
+}
+</code></pre>
 </body>
 </html>
